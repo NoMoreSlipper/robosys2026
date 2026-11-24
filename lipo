@@ -1,0 +1,135 @@
+#!/usr/bin/python3
+# SPDX-FileCopyrightText: 2026 TakumiYamawaki <takumi5yamawaki@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+"""lipo: LiPoバッテリーの電圧から残量を推定するコマンド.
+
+標準入力から電圧 [V] を1行に1つ読み取り, セル数を自動判定して
+1セルあたりの電圧と残量 [%] を標準出力に書き出す.
+残量は静置電圧に対する放電特性テーブルを線形補間して推定する.
+"""
+
+import argparse
+import math
+import sys
+
+# 静置時の1セル電圧 [V] -> 残量 [%] の対応表 (降順)
+VOLTAGE_TABLE = [
+    (4.20, 100.0),
+    (4.00, 80.0),
+    (3.85, 60.0),
+    (3.75, 45.0),
+    (3.70, 30.0),
+    (3.60, 15.0),
+    (3.50, 8.0),
+    (3.40, 4.0),
+    (3.30, 0.0),
+]
+
+FULL_CELL_VOLTAGE = 4.20      # 満充電時の1セル電圧 [V]
+OVER_DISCHARGE_VOLTAGE = 3.30  # これ未満は過放電のおそれ
+OVER_CHARGE_VOLTAGE = 4.25     # これを超えたら過充電のおそれ
+STORAGE_RANGE = (3.78, 3.88)   # 保管に適した1セル電圧の範囲 [V]
+
+
+def detect_cells(total_voltage):
+    """総電圧からセル数を推定する (1セル最大 4.20 V と仮定)."""
+    if total_voltage <= 0:
+        raise ValueError("voltage must be positive")
+    return max(1, math.ceil(total_voltage / FULL_CELL_VOLTAGE - 1e-6))
+
+
+def estimate_percent(cell_voltage):
+    """1セル電圧から残量 [%] を線形補間で推定する."""
+    if cell_voltage >= VOLTAGE_TABLE[0][0]:
+        return 100.0
+    if cell_voltage <= VOLTAGE_TABLE[-1][0]:
+        return 0.0
+    for (v_hi, p_hi), (v_lo, p_lo) in zip(VOLTAGE_TABLE, VOLTAGE_TABLE[1:]):
+        if v_lo <= cell_voltage <= v_hi:
+            ratio = (cell_voltage - v_lo) / (v_hi - v_lo)
+            return p_lo + ratio * (p_hi - p_lo)
+    return 0.0  # pragma: no cover
+
+
+def status_of(cell_voltage):
+    """1セル電圧に対する状態メッセージを返す (なければ空文字列)."""
+    if cell_voltage > OVER_CHARGE_VOLTAGE:
+        return "過充電のおそれ"
+    if cell_voltage < OVER_DISCHARGE_VOLTAGE:
+        return "過放電のおそれ（直ちに充電してください）"
+    if STORAGE_RANGE[0] <= cell_voltage <= STORAGE_RANGE[1]:
+        return "保管に適した電圧"
+    if cell_voltage >= 4.15:
+        return "満充電付近"
+    if cell_voltage < 3.50:
+        return "残量わずか"
+    return ""
+
+
+def format_reading(total_voltage, cells):
+    """1件分の出力行と (1セル電圧, 残量) を返す."""
+    cell_voltage = total_voltage / cells
+    percent = estimate_percent(cell_voltage)
+    line = (f"{total_voltage:.2f} V → {cells}セル"
+            f"（1セル {cell_voltage:.2f} V）残量 約{percent:.0f}%")
+    status = status_of(cell_voltage)
+    if status:
+        line += f" / {status}"
+    return line, cell_voltage, percent
+
+
+def parse_voltage(text):
+    """'11.1' や '11.1V' のような文字列を float に変換する."""
+    s = text.strip()
+    if s.endswith(("V", "v")):
+        s = s[:-1].strip()
+    return float(s)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="lipo",
+        description="LiPoバッテリーの電圧から残量を推定する")
+    parser.add_argument("--cells", type=int, default=None,
+                        help="セル数を固定する (自動判定しない)")
+    args = parser.parse_args(argv)
+    if args.cells is not None and args.cells <= 0:
+        parser.error("--cells は正の整数にしてください")
+
+    results = []
+    skipped = 0
+    for raw in sys.stdin:
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            voltage = parse_voltage(text)
+            if voltage <= 0:
+                raise ValueError
+            cells = args.cells if args.cells else detect_cells(voltage)
+        except ValueError:
+            print(f"lipo: 数値として読めません: {text!r}", file=sys.stderr)
+            skipped += 1
+            continue
+        line, cell_voltage, percent = format_reading(voltage, cells)
+        print(line)
+        results.append((cell_voltage, percent))
+
+    if not results:
+        print("lipo: 有効な電圧が入力されませんでした", file=sys.stderr)
+        return 1
+
+    if len(results) >= 2:
+        min_cell = min(r[0] for r in results)
+        avg_pct = sum(r[1] for r in results) / len(results)
+        over = sum(1 for r in results if r[0] < OVER_DISCHARGE_VOLTAGE)
+        summary = (f"-- まとめ: {len(results)}件 / 1セル最低 {min_cell:.2f} V"
+                   f" / 平均残量 約{avg_pct:.0f}% / 過放電 {over}件")
+        if skipped:
+            summary += f" / 読めなかった行 {skipped}件"
+        print(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
